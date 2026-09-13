@@ -1208,6 +1208,11 @@ with tabs[6]:
                             "로컬 실행에서는 data 폴더에 파일이 이미 저장됩니다. "
                             "GitHub/Streamlit Cloud에 배포할 때만 생성된 CSV를 data 폴더에 한 번 올려두면 이후 API 호출이 없습니다."
                         )
+
+                        # load_csv()가 @st.cache_data로 감싸져 있어 최초 실행 시
+                        # '파일 없음 → 빈 DataFrame' 결과가 캐시에 남는다.
+                        # 방금 생성한 CSV를 rerun에서 즉시 다시 읽도록 캐시를 비운다.
+                        st.cache_data.clear()
                         st.rerun()
 
                     except Exception as e:
