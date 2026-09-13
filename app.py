@@ -216,9 +216,88 @@ def _oil_price(detail, prodcd):
     return np.nan
 
 
+def _coord_pair_from_mapping(obj):
+    """GIS 좌표쌍을 안전하게 숫자로 읽는다."""
+    if obj is None:
+        return np.nan, np.nan
+    x = pd.to_numeric(obj.get("GIS_X_COOR"), errors="coerce")
+    y = pd.to_numeric(obj.get("GIS_Y_COOR"), errors="coerce")
+    return x, y
+
+
+def _geocode_address_to_katec(address, station_name=""):
+    """
+    오피넷 상세응답에 좌표가 없을 때만 사용하는 주소 기반 보완.
+    OpenStreetMap Nominatim의 WGS84(lat/lon)를 받은 뒤 기존 로직이 사용하는
+    KATEC 좌표로 변환한다. 실패하면 (nan, nan, 오류메시지)를 반환한다.
+    """
+    addr = str(address or "").strip()
+    if not addr:
+        return np.nan, np.nan, "주소 없음"
+
+    # 서울 주소임을 명시해 동명이인 매칭을 줄인다.
+    queries = []
+    for q in [addr, f"{station_name} {addr}".strip()]:
+        if q and q not in queries:
+            queries.append(q)
+
+    headers = {
+        "User-Agent": "GSCaltex-Retail-Commercial-Analysis/1.0 (educational portfolio)",
+        "Accept-Language": "ko,en;q=0.8",
+    }
+
+    last_error = "검색 결과 없음"
+    for q in queries:
+        try:
+            r = requests.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={
+                    "q": q,
+                    "format": "jsonv2",
+                    "limit": 1,
+                    "countrycodes": "kr",
+                    "addressdetails": 0,
+                },
+                headers=headers,
+                timeout=20,
+            )
+            r.raise_for_status()
+            data = r.json()
+            if not data:
+                last_error = f"검색 결과 없음: {q}"
+                time.sleep(1.05)
+                continue
+
+            lon = float(data[0]["lon"])
+            lat = float(data[0]["lat"])
+
+            # WGS84 -> 오피넷에서 사용하던 KATEC
+            from pyproj import CRS, Transformer
+
+            wgs84 = CRS.from_epsg(4326)
+            katec = CRS.from_proj4(
+                "+proj=tmerc +lat_0=38 +lon_0=128 +k=0.9999 "
+                "+x_0=400000 +y_0=600000 +ellps=bessel +units=m "
+                "+towgs84=-115.80,474.99,674.11,1.16,-2.31,-1.63,6.43 +no_defs"
+            )
+            transformer = Transformer.from_crs(wgs84, katec, always_xy=True)
+            x, y = transformer.transform(lon, lat)
+            return float(x), float(y), ""
+
+        except Exception as e:
+            last_error = str(e)
+        finally:
+            # Nominatim 공개 서비스의 요청 간격을 보수적으로 유지
+            time.sleep(1.05)
+
+    return np.nan, np.nan, last_error
+
+
 def _create_full_opinet_snapshot(api_key, seed_df, progress=None):
     """
     사용자가 버튼을 한 번 누르면 81개를 한 배치로 조회.
+    상세정보와 기존 유외시설은 좌표 유무와 관계없이 보존한다.
+    좌표는 ① 상세응답 → ② 기존 스냅샷 → ③ 주소 지오코딩 순서로 보완한다.
     완료 후 CSV 저장 → 이후 실행에서는 API를 다시 호출하지 않음.
     """
     rows = []
@@ -227,64 +306,90 @@ def _create_full_opinet_snapshot(api_key, seed_df, progress=None):
 
     for i, (_, seed) in enumerate(seed_df.reset_index(drop=True).iterrows(), start=1):
         sid = str(seed["station_id"])
+        detail_error = ""
+
         try:
             d, auth = _detail_by_id_once(api_key, sid)
-
-            row = {
-                "station_id": sid,
-                "station_name": d.get("OS_NM") or seed.get("station_name"),
-                "brand_code": d.get("POLL_DIV_CD") or d.get("POLL_DIV_CO") or seed.get("brand_code"),
-                "address": d.get("NEW_ADR") or seed.get("address"),
-                "jibun_address": d.get("VAN_ADR"),
-                "district": seed.get("district"),
-                "telephone": d.get("TEL") or seed.get("telephone"),
-                "gasoline_price": _oil_price(d, "B027"),
-                "diesel_price": _oil_price(d, "D047"),
-                "premium_gasoline_price": _oil_price(d, "B034"),
-                "kerosene_price": _oil_price(d, "C004"),
-                "CAR_WASH_YN": d.get("CAR_WASH_YN", seed.get("CAR_WASH_YN")),
-                "MAINT_YN": d.get("MAINT_YN", seed.get("MAINT_YN")),
-                "CVS_YN": d.get("CVS_YN", seed.get("CVS_YN")),
-                "GIS_X_COOR": pd.to_numeric(d.get("GIS_X_COOR"), errors="coerce"),
-                "GIS_Y_COOR": pd.to_numeric(d.get("GIS_Y_COOR"), errors="coerce"),
-                "detail_auth": auth,
-                "snapshot_date": SNAPSHOT_DATE,
-                "api_status": "SUCCESS",
-            }
-
-            if pd.isna(row["GIS_X_COOR"]) or pd.isna(row["GIS_Y_COOR"]):
-                raise RuntimeError("상세응답에 GIS 좌표가 없음")
-
-            rows.append(row)
-
         except Exception as e:
-            failures.append(f"{sid}: {e}")
-            rows.append({
-                "station_id": sid,
-                "station_name": seed.get("station_name"),
-                "address": seed.get("address"),
-                "district": seed.get("district"),
-                "CAR_WASH_YN": seed.get("CAR_WASH_YN"),
-                "MAINT_YN": seed.get("MAINT_YN"),
-                "CVS_YN": seed.get("CVS_YN"),
-                "GIS_X_COOR": np.nan,
-                "GIS_Y_COOR": np.nan,
-                "snapshot_date": SNAPSHOT_DATE,
-                "api_status": "FAILED",
-                "api_error": str(e),
-            })
+            # 상세조회가 실패해도 seed에 있는 기본정보/시설정보는 버리지 않는다.
+            d = {}
+            auth = ""
+            detail_error = str(e)
+            failures.append(f"{sid}: 상세조회 실패 · {e}")
+
+        row = {
+            "station_id": sid,
+            "station_name": d.get("OS_NM") or seed.get("station_name"),
+            "brand_code": d.get("POLL_DIV_CD") or d.get("POLL_DIV_CO") or seed.get("brand_code"),
+            "address": d.get("NEW_ADR") or seed.get("address"),
+            "jibun_address": d.get("VAN_ADR") or seed.get("jibun_address"),
+            "district": seed.get("district"),
+            "telephone": d.get("TEL") or seed.get("telephone"),
+            "gasoline_price": _oil_price(d, "B027") if d else np.nan,
+            "diesel_price": _oil_price(d, "D047") if d else np.nan,
+            "premium_gasoline_price": _oil_price(d, "B034") if d else np.nan,
+            "kerosene_price": _oil_price(d, "C004") if d else np.nan,
+            "CAR_WASH_YN": d.get("CAR_WASH_YN", seed.get("CAR_WASH_YN")),
+            "MAINT_YN": d.get("MAINT_YN", seed.get("MAINT_YN")),
+            "CVS_YN": d.get("CVS_YN", seed.get("CVS_YN")),
+            "detail_auth": auth,
+            "snapshot_date": SNAPSHOT_DATE,
+            "detail_status": "SUCCESS" if d else "FAILED",
+            "detail_error": detail_error,
+        }
+
+        # 1) 오피넷 상세응답 좌표
+        x, y = _coord_pair_from_mapping(d)
+        coord_source = "OPINET_DETAIL" if pd.notna(x) and pd.notna(y) else ""
+        coord_error = ""
+
+        # 2) 기존 스냅샷 좌표가 있다면 재사용
+        if pd.isna(x) or pd.isna(y):
+            sx, sy = _coord_pair_from_mapping(seed)
+            if pd.notna(sx) and pd.notna(sy):
+                x, y = sx, sy
+                coord_source = "SEED_SNAPSHOT"
+
+        # 3) 그래도 없으면 도로명주소 → 지번주소 순으로 주소 지오코딩
+        if pd.isna(x) or pd.isna(y):
+            addresses = []
+            for a in [row.get("address"), row.get("jibun_address")]:
+                a = str(a or "").strip()
+                if a and a.lower() != "nan" and a not in addresses:
+                    addresses.append(a)
+
+            for a in addresses:
+                gx, gy, ge = _geocode_address_to_katec(a, row.get("station_name", ""))
+                if pd.notna(gx) and pd.notna(gy):
+                    x, y = gx, gy
+                    coord_source = "ADDRESS_GEOCODE"
+                    coord_error = ""
+                    break
+                coord_error = ge
+
+        row["GIS_X_COOR"] = x
+        row["GIS_Y_COOR"] = y
+        row["coord_source"] = coord_source or "UNRESOLVED"
+        row["coord_status"] = "SUCCESS" if pd.notna(x) and pd.notna(y) else "FAILED"
+        row["coord_error"] = coord_error
+        row["api_status"] = "SUCCESS" if d else "FAILED"
+
+        if row["coord_status"] == "FAILED":
+            failures.append(
+                f"{sid}: 좌표 미확보 · {row.get('station_name')} · {coord_error or '좌표 없음'}"
+            )
+
+        rows.append(row)
 
         if progress is not None:
             progress.progress(i / total, text=f"오피넷 상세정보 수집 {i}/{total}")
 
     df = pd.DataFrame(rows)
 
-    # 좌표 없는 행이 있으면 중간 산출물은 저장하되, 전략계산은 중단한다.
     out = DATA_DIR / "opinet_station_full_20260913.csv"
     df.to_csv(out, index=False, encoding="utf-8-sig")
 
     return df, failures
-
 
 def _find_trade_area_zip():
     patterns = ["*영역*상권*.zip", "*상권*영역*.zip"]
@@ -341,7 +446,7 @@ def _spatial_match_station_trade_area(full_df, trade_df):
     from shapely.geometry import Point
     from pyproj import CRS
 
-    # 오피넷 KATEC
+    # 오피넷/KATEC 좌표계
     katec = CRS.from_proj4(
         "+proj=tmerc +lat_0=38 +lon_0=128 +k=0.9999 "
         "+x_0=400000 +y_0=600000 +ellps=bessel +units=m "
@@ -350,68 +455,90 @@ def _spatial_match_station_trade_area(full_df, trade_df):
 
     areas, code_col, name_col = _load_trade_area_geometry()
     if areas.crs is None:
-        # 서울 상권영역의 일반적 좌표계. 실제 파일에 CRS가 있으면 그 값을 우선.
         areas = areas.set_crs(epsg=5181)
 
-    valid = full_df[
-        full_df["GIS_X_COOR"].notna() & full_df["GIS_Y_COOR"].notna()
-    ].copy()
+    base = full_df.copy()
+    valid_mask = base["GIS_X_COOR"].notna() & base["GIS_Y_COOR"].notna()
+    valid = base.loc[valid_mask].copy()
+    invalid = base.loc[~valid_mask].copy()
 
-    pts = gpd.GeoDataFrame(
-        valid,
-        geometry=[
-            Point(float(x), float(y))
-            for x, y in zip(valid["GIS_X_COOR"], valid["GIS_Y_COOR"])
-        ],
-        crs=katec,
-    ).to_crs(areas.crs)
+    matched_parts = []
 
-    keep = [code_col, "geometry"]
-    if name_col is not None:
-        keep.insert(1, name_col)
+    if not valid.empty:
+        pts = gpd.GeoDataFrame(
+            valid,
+            geometry=[
+                Point(float(x), float(y))
+                for x, y in zip(valid["GIS_X_COOR"], valid["GIS_Y_COOR"])
+            ],
+            crs=katec,
+        ).to_crs(areas.crs)
 
-    joined = gpd.sjoin(pts, areas[keep], how="left", predicate="within")
-    joined["match_method"] = np.where(joined[code_col].notna(), "상권 내부", "")
+        keep = [code_col, "geometry"]
+        if name_col is not None:
+            keep.insert(1, name_col)
 
-    # 상권 경계 밖 주유소는 최근접 상권을 연결하되 거리 기록.
-    missing = joined.index[joined[code_col].isna()].tolist()
-    if missing:
-        nearest = gpd.sjoin_nearest(
-            pts.loc[missing],
-            areas[keep],
-            how="left",
-            distance_col="trade_area_distance_m",
+        joined = gpd.sjoin(pts, areas[keep], how="left", predicate="within")
+        joined["match_method"] = np.where(joined[code_col].notna(), "상권 내부", "")
+
+        # 상권 경계 밖 주유소는 최근접 상권을 연결하되 거리 기록.
+        missing = joined.index[joined[code_col].isna()].tolist()
+        if missing:
+            nearest = gpd.sjoin_nearest(
+                pts.loc[missing],
+                areas[keep],
+                how="left",
+                distance_col="trade_area_distance_m",
+            )
+            nearest = nearest.sort_values("trade_area_distance_m").groupby(level=0).first()
+            for idx, rr in nearest.iterrows():
+                joined.loc[idx, code_col] = rr.get(code_col)
+                if name_col is not None:
+                    joined.loc[idx, name_col] = rr.get(name_col)
+                joined.loc[idx, "trade_area_distance_m"] = rr.get("trade_area_distance_m")
+                joined.loc[idx, "match_method"] = "최근접 상권"
+
+        joined = pd.DataFrame(joined.drop(columns=["geometry", "index_right"], errors="ignore"))
+        joined = joined.rename(columns={code_col: "상권_코드"})
+        if name_col is not None:
+            joined = joined.rename(columns={name_col: "matched_trade_area_name"})
+        matched_parts.append(joined)
+
+    # 좌표가 끝까지 없는 주유소도 결과에서 제거하지 않는다.
+    if not invalid.empty:
+        invalid["상권_코드"] = pd.Series(pd.NA, index=invalid.index, dtype="Int64")
+        invalid["matched_trade_area_name"] = np.nan
+        invalid["trade_area_distance_m"] = np.nan
+        invalid["match_method"] = "좌표 미확보"
+        matched_parts.append(invalid)
+
+    if not matched_parts:
+        return base.assign(
+            상권_코드=pd.Series(pd.NA, index=base.index, dtype="Int64"),
+            match_method="좌표 미확보",
+            match_status="NO_COORD",
+            match_quality="미확인",
         )
-        nearest = nearest.sort_values("trade_area_distance_m").groupby(level=0).first()
-        for idx, rr in nearest.iterrows():
-            joined.loc[idx, code_col] = rr.get(code_col)
-            if name_col is not None:
-                joined.loc[idx, name_col] = rr.get(name_col)
-            joined.loc[idx, "trade_area_distance_m"] = rr.get("trade_area_distance_m")
-            joined.loc[idx, "match_method"] = "최근접 상권"
 
-    joined = pd.DataFrame(joined.drop(columns=["geometry", "index_right"], errors="ignore"))
-    joined = joined.rename(columns={code_col: "상권_코드"})
-    if name_col is not None:
-        joined = joined.rename(columns={name_col: "matched_trade_area_name"})
-
-    joined["상권_코드"] = pd.to_numeric(joined["상권_코드"], errors="coerce").astype("Int64")
+    joined_all = pd.concat(matched_parts, axis=0, ignore_index=False).sort_index()
+    joined_all["상권_코드"] = pd.to_numeric(joined_all["상권_코드"], errors="coerce").astype("Int64")
 
     trade = trade_df.copy()
     trade["상권_코드"] = pd.to_numeric(trade["상권_코드"], errors="coerce").astype("Int64")
 
-    merged = joined.merge(
+    merged = joined_all.merge(
         trade,
         on="상권_코드",
         how="left",
         suffixes=("", "_trade"),
     )
 
-    # 정확성 안전장치
-    merged["match_status"] = np.where(
-        merged["상권_코드"].notna() & merged["상권_코드_명"].notna(),
-        "MATCHED",
-        "UNMATCHED",
+    has_coord = merged["GIS_X_COOR"].notna() & merged["GIS_Y_COOR"].notna()
+    matched_ok = merged["상권_코드"].notna() & merged["상권_코드_명"].notna()
+    merged["match_status"] = np.select(
+        [~has_coord, matched_ok],
+        ["NO_COORD", "MATCHED"],
+        default="UNMATCHED",
     )
 
     def q(r):
@@ -428,7 +555,6 @@ def _spatial_match_station_trade_area(full_df, trade_df):
 
     merged["match_quality"] = merged.apply(q, axis=1)
     return merged
-
 
 def _rank_pct(base, value):
     s = pd.to_numeric(base, errors="coerce").dropna()
@@ -590,17 +716,8 @@ def _build_everything_once(api_key, seed_df, trade_df, progress=None):
         api_key, seed_df, progress=progress
     )
 
-    coord_fail = full_df[
-        full_df["GIS_X_COOR"].isna() | full_df["GIS_Y_COOR"].isna()
-    ]
-
-    if not coord_fail.empty:
-        failed_names = ", ".join(coord_fail["station_name"].astype(str).head(5).tolist())
-        raise RuntimeError(
-            f"좌표 수집 실패 {len(coord_fail)}개. 예: {failed_names}. "
-            "잘못된 0값을 만들지 않고 여기서 중단했습니다."
-        )
-
+    # 좌표가 일부 없어도 전체 작업을 중단하지 않는다.
+    # 확보된 주유소는 상권매칭/전략 생성을 진행하고, 미확보 주유소는 NO_COORD로 남긴다.
     matched = _spatial_match_station_trade_area(full_df, trade_df)
 
     if (matched["match_status"] == "MATCHED").sum() == 0:
@@ -1069,10 +1186,17 @@ with tabs[6]:
                         prog.progress(1.0, text="완료")
 
                         matched_n = int(generated["match_status"].eq("MATCHED").sum())
+                        no_coord_n = int(generated["match_status"].eq("NO_COORD").sum())
+                        geocoded_n = int(full_df.get("coord_source", pd.Series(dtype=str)).astype(str).eq("ADDRESS_GEOCODE").sum())
                         st.success(
                             f"완료 · 오피넷 {len(full_df)}개 수집 · 상권매칭 {matched_n}/{len(generated)}개 · "
-                            "주유소별 전략 생성 완료"
+                            f"주소기반 좌표보완 {geocoded_n}개 · 좌표 미확보 {no_coord_n}개"
                         )
+                        if no_coord_n > 0:
+                            st.warning(
+                                f"좌표를 끝까지 확보하지 못한 {no_coord_n}개 주유소는 임의의 0값을 넣지 않고 "
+                                "NO_COORD로 보존했습니다. 나머지 주유소의 전략은 정상 생성했습니다."
+                            )
 
                         st.download_button(
                             "완성된 station_strategy_20260913.csv 다운로드",
@@ -1089,7 +1213,8 @@ with tabs[6]:
                     except Exception as e:
                         st.error(f"생성 중단: {e}")
                         st.caption(
-                            "매칭 또는 좌표가 실패하면 0으로 대체하지 않고 중단하도록 설계했습니다."
+                            "좌표가 일부 실패해도 0으로 대체하지 않고 NO_COORD로 보존합니다. "
+                            "전체 상권매칭이 0개인 경우처럼 분석 자체가 불가능할 때만 중단합니다."
                         )
 
     else:
